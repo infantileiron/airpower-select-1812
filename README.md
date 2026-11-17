@@ -8,7 +8,7 @@
 
 上游是压力/气量/温度/开机台数和电表小时记录；本应用替代时间窗校验、特征配置、模型比选和评议留痕；下游是工艺负责人安排安全可控的试点。
 
-四页分别为耗电样本、特征方案、模型比选、节能评议。三类核心实体为Sample（小时计量）、Run（特征/alpha配置与冻结模型结果）、Review（观察、业务动作和签核）；另有User和Audit。
+四页分别为耗电样本、特征方案、模型比选、节能评议；第五页“仪表纠偏”处理修订分支。三类核心实体为Sample（小时计量）、Run（特征/alpha配置与冻结模型结果）、Review（观察、业务动作和签核）；纠偏相关为CorrectionBranch（基线快照与分支状态）、BranchChange（小时×字段级修订）、Trial（隔离试算）；另有User和Audit。
 
 |角色|权限|典型动作|
 |---|---|---|
@@ -50,17 +50,30 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 所有选择使用提交时冻结输入；修订原始计量不会改写旧版本。反复查看末段指标选择特征后，该末段不再是独立最终测试集，实际落地需另设未见时间窗。没有自动控制空压机或在线模型部署。
 
+## 仪表纠偏：先试算再替换正式样本
+
+仪表纠偏要先在分支内试算，确认效果后才允许替换正式样本，全过程不污染正式训练。
+
+1. **建分支保留基线**：分支创建时把当前正式样本完整快照为基线并记录校验和；分支不新增也不删除小时，时间窗与基线一致。正式训练（`/runs`）始终读取正式样本，试算不产生正式版本。
+2. **按小时批量改数**：仅工况与耗电字段（压力、气量、温度、开机台数、对照噪声、耗电）可修订，取值边界与正式录入一致；以“小时|字段|新值|原因”批量提交，同分支同小时同字段唯一。试算中、发布中、已发布的分支冻结改数。
+3. **隔离试算**：基线与分支共用同一时间窗、同小时同顺序，各自仅用自己的训练段（前80%）做3折扩展窗选 alpha，最后20%各自末段评估，页面并排比较 CV RMSE、末段 RMSE、基线 RMSE、选中 alpha 与系数。
+4. **三方合并发布**：发布按基线 B、分支 T、当前正式 C 逐字段合并。分支未触碰的字段保留当前值（含并行修订）；分支要改而正式已改（C≠B 且 C≠T）即同字段异值，列出冲突并整体拒绝；当前样本缺失基线小时也拒绝。互不冲突的改动全部保留。
+5. **重新训练与同事务可见**：合并数据先在 worker 重新训练，成功后样本改动与新版本在同一事务落地，二者一并可见，新版本经 `source_branch_id` 关联分支（唯一约束保证一分支至多一版本）。训练失败则回滚新版本、正式数据原样保留。
+6. **并发与可靠性**：发起发布时冻结正式样本校验和，worker 落地前二次校验；计算期间正式样本再被修订则拒绝发布。重试不重复发布（已发布分支与重复队列消息幂等忽略）；worker 重启把 queued/running 的模型、试算任务及 publishing 分支重新入队，中断可恢复。旧版本与既有评议始终可读。
+
+分支状态机：草稿 draft → 试算中 trialing →（成功 ready / 失败 trial_failed）→ 发布中 publishing →（已发布 published / 发布失败 publish_failed / 冲突 conflict）。冲突或失败后可改数回草稿重新试算，发布失败在回退干扰修订后可直接重试。
+
 ## 工程说明
 
-Python3.11/FastAPI/SQLAlchemy/scikit-learn/NumPy、原生ES modules/CSS、Nginx、MySQL8、Redis7。恰好五服务frontend/backend/worker/db/redis；全部有健康检查；后端等数据库/Redis，worker还等后端，前端等后端。worker真实消费Redis模型任务，心跳`/tmp/heartbeat`，结果写共享`/artifacts`卷；重启恢复queued/running任务。数据库、Redis和结果均命名卷。
+Python3.11/FastAPI/SQLAlchemy/scikit-learn/NumPy、原生ES modules/CSS、Nginx、MySQL8、Redis7。恰好五服务frontend/backend/worker/db/redis；全部有健康检查；后端等数据库/Redis，worker还等后端，前端等后端。worker真实消费Redis三个队列（模型`airpower:runs`、试算`airpower:trials`、发布`airpower:publishes`），心跳`/tmp/heartbeat`，结果写共享`/artifacts`卷；重启恢复queued/running任务与publishing分支。数据库、Redis和结果均命名卷。
 
 Nginx `/api/`转后端根路由，前端SPA回落。仅前端、后端和数据库映射宿主端口。用 `docker compose down -v --remove-orphans`清理本项目测试数据。
 
 目录：backend/src按models/schemas/services/controllers/routes/middlewares/config/constants/utils分工；frontend/src按api/stores/types/components/common/hooks/pages/router/utils/constants分工。共用表格、表单、状态标签；表单hooks/HTML转义utils；请求ID和安全头中间件，全局异常处理，写操作审计。首次表结构由ORM创建，migrations提供实测数据库导出的初始DDL，未带在线迁移执行器。
 
-本地开发可先启动db/redis，backend安装requirements并设DATABASE_URL/REDIS_URL/JWT_SECRET后运行 `uvicorn src.main:app --reload`；前端使用Nginx或同源代理。依赖固定在requirements.txt。
+本地开发可先启动db/redis，backend安装requirements并设DATABASE_URL/REDIS_URL/JWT_SECRET后运行 `uvicorn src.main:app --reload`；前端使用Nginx或同源代理。依赖固定在requirements.txt。worker产物目录可用环境变量ARTIFACT_DIR覆盖（默认`/artifacts`）。
 
-变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。独立子网10.253.110.0/24规避当前机器地址池耗尽，迁移可调整。角色ROLES、任务STATES、特征FEATURES和评议REVIEW_STATES分别定义在后端src/constants/enums.py与前端src/constants/enums.js，schema校验在backend/src/schemas/business.py，持久化列见models/entities.py。
+变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。独立子网10.253.110.0/24规避当前机器地址池耗尽，迁移可调整。角色ROLES、任务STATES、特征FEATURES、评议REVIEW_STATES、纠偏字段CORRECTION_FIELDS、分支BRANCH_STATES/试算TRIAL_STATES分别定义在后端src/constants/enums.py与前端src/constants/enums.js，schema校验在backend/src/schemas/business.py，持久化列见models/entities.py（新增correction_branches、branch_changes、trials三表，runs增加source_branch_id）。
 
 ## 范围与交付
 
